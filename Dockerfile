@@ -194,13 +194,23 @@ set -e
 # Start MariaDB
 mysqld_safe --user=mysql --datadir=/var/lib/mysql &
 
-# Start Redis
-redis-server /etc/redis/redis.conf &
-
-# Wait for services to be ready
+# Wait for MariaDB to be ready
 echo "Waiting for MariaDB..."
 while ! mysqladmin ping --silent; do sleep 1; done
 
+# Initialize database on first run
+if ! mysql -e "USE panel;" 2>/dev/null; then
+    echo "Setting up database..."
+    mysql -e "CREATE DATABASE panel;"
+    mysql -e "CREATE USER 'pterodactyl'@'localhost' IDENTIFIED BY 'thisisthepasswordforpterodactyl';"
+    mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'localhost';"
+    mysql -e "FLUSH PRIVILEGES;"
+fi
+
+# Start Redis
+redis-server /etc/redis/redis.conf &
+
+# Wait for Redis
 echo "Waiting for Redis..."
 while ! redis-cli ping > /dev/null 2>&1; do sleep 1; done
 
