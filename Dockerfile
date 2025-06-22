@@ -37,6 +37,7 @@ FROM ubuntu:22.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
 
 # Install all required packages
 RUN apt-get update && apt-get install -y \
@@ -46,7 +47,7 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     lsb-release \
     ca-certificates \
-    && add-apt-repository ppa:ondrej/php \
+    && add-apt-repository ppa:ondrej/php -y \
     && apt-get update && apt-get install -y \
     # MariaDB
     mariadb-server \
@@ -73,18 +74,31 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# Configure MariaDB
+RUN sed -i 's/^bind-address\s*=.*$/bind-address = 0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf && \
+    mkdir -p /var/run/mysqld && \
+    chown mysql:mysql /var/run/mysqld
+
+# Configure Redis
+RUN sed -i 's/^bind 127.0.0.1 ::1$/bind 0.0.0.0/' /etc/redis/redis.conf && \
+    sed -i 's/^daemonize yes$/daemonize no/' /etc/redis/redis.conf && \
+    sed -i 's/^supervised no$/supervised systemd/' /etc/redis/redis.conf && \
+    mkdir -p /var/log/redis && \
+    chown redis:redis /var/log/redis
+
 # Create PHP configuration files
-RUN echo "display_errors = On" > /etc/php/8.2/fpm/conf.d/99-extra.ini
-RUN echo "display_errors = On" > /etc/php/8.2/cli/conf.d/99-extra.ini
+RUN echo "display_errors = On" > /etc/php/8.2/fpm/conf.d/99-extra.ini && \
+    echo "display_errors = On" > /etc/php/8.2/cli/conf.d/99-extra.ini && \
+    echo "upload_max_filesize = 100M" >> /etc/php/8.2/fpm/conf.d/99-extra.ini && \
+    echo "post_max_size = 100M" >> /etc/php/8.2/fpm/conf.d/99-extra.ini
 
 # Configure PHP-FPM
-RUN echo "catch_workers_output = On" >> /etc/php/8.2/fpm/pool.d/www.conf && \
-    echo "chdir = /var/www/html/public/" >> /etc/php/8.2/fpm/pool.d/www.conf && \
-    echo "php_admin_value[upload_max_filesize] = 100M" >> /etc/php/8.2/fpm/pool.d/www.conf && \
-    echo "php_admin_value[post_max_size] = 100M" >> /etc/php/8.2/fpm/pool.d/www.conf
+RUN sed -i 's/^listen = .*/listen = 127.0.0.1:9000/' /etc/php/8.2/fpm/pool.d/www.conf && \
+    echo "catch_workers_output = yes" >> /etc/php/8.2/fpm/pool.d/www.conf && \
+    echo "chdir = /var/www/html/public/" >> /etc/php/8.2/fpm/pool.d/www.conf
 
 # Configure Nginx
-RUN rm /etc/nginx/sites-enabled/default
+RUN rm -f /etc/nginx/sites-enabled/default
 COPY <<EOF /etc/nginx/sites-available/pterodactyl
 server {
     listen 80;
@@ -92,15 +106,18 @@ server {
     root /var/www/html/public;
     index index.php;
 
+    client_max_body_size 100M;
+
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
     location ~ \.php$ {
-        fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
+        fastcgi_pass 127.0.0.1:9000;
         fastcgi_index index.php;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         include fastcgi_params;
+        fastcgi_read_timeout 300;
     }
 
     location ~ /\.ht {
@@ -110,13 +127,6 @@ server {
 EOF
 
 RUN ln -s /etc/nginx/sites-available/pterodactyl /etc/nginx/sites-enabled/
-
-# Setup MariaDB
-RUN service mariadb start && \
-    mysql -e "CREATE DATABASE panel;" && \
-    mysql -e "CREATE USER 'pterodactyl'@'localhost' IDENTIFIED BY 'thisisthepasswordforpterodactyl';" && \
-    mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'localhost';" && \
-    mysql -e "FLUSH PRIVILEGES;"
 
 # Install Composer
 RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
@@ -133,7 +143,8 @@ RUN sed -i 's/DB_HOST=.*/DB_HOST=localhost/' .env && \
     sed -i 's/DB_USERNAME=.*/DB_USERNAME=pterodactyl/' .env && \
     sed -i 's/DB_PASSWORD=.*/DB_PASSWORD=thisisthepasswordforpterodactyl/' .env && \
     sed -i 's/CACHE_DRIVER=.*/CACHE_DRIVER=redis/' .env && \
-    sed -i 's/REDIS_HOST=.*/REDIS_HOST=localhost/' .env
+    sed -i 's/REDIS_HOST=.*/REDIS_HOST=localhost/' .env && \
+    sed -i 's/REDIS_PORT=.*/REDIS_PORT=6379/' .env
 
 # Set permissions
 RUN chown -R www-data:www-data /var/www/html && \
@@ -141,97 +152,62 @@ RUN chown -R www-data:www-data /var/www/html && \
 
 # Setup cron
 RUN echo "* * * * * www-data /usr/bin/php /var/www/html/artisan schedule:run >> /dev/null 2>&1" > /etc/cron.d/pterodactyl && \
-    chmod 0644 /etc/cron.d/pterodactyl
+    chmod 0644 /etc/cron.d/pterodactyl && \
+    crontab /etc/cron.d/pterodactyl
 
-# Configure Redis
-RUN mkdir -p /var/log/redis && \
-    chown redis:redis /var/log/redis && \
-    sed -i 's/^bind 127.0.0.1 ::1$/bind 0.0.0.0/' /etc/redis/redis.conf && \
-    sed -i 's/^# supervised no$/supervised systemd/' /etc/redis/redis.conf
+# Create initialization script
+COPY <<EOF /init-db.sh
+#!/bin/bash
+set -e
 
-# Configure Supervisor
-COPY <<EOF /etc/supervisor/conf.d/pterodactyl.conf
-[supervisord]
-nodaemon=true
-user=root
-logfile=/var/log/supervisor/supervisord.log
-pidfile=/var/run/supervisord.pid
+# Initialize MariaDB
+mysql_install_db --user=mysql --datadir=/var/lib/mysql
 
-[program:mariadb]
-command=/usr/bin/mysqld_safe
-user=mysql
-autostart=true
-autorestart=true
-priority=100
-stdout_logfile=/var/log/supervisor/mariadb.log
-stderr_logfile=/var/log/supervisor/mariadb.log
+# Start MariaDB in background
+mysqld_safe --user=mysql --datadir=/var/lib/mysql &
+MYSQL_PID=\$!
 
-[program:redis]
-command=/usr/bin/redis-server /etc/redis/redis.conf --daemonize no
-user=redis
-autostart=true
-autorestart=true
-priority=200
-stdout_logfile=/var/log/supervisor/redis.log
-stderr_logfile=/var/log/supervisor/redis.log
+# Wait for MariaDB to be ready
+echo "Waiting for MariaDB to start..."
+while ! mysqladmin ping --silent; do
+    sleep 2
+done
 
-[program:php-fpm]
-command=/usr/sbin/php-fpm8.2 -F
-autostart=true
-autorestart=true
-priority=300
-stdout_logfile=/var/log/supervisor/php-fpm.log
-stderr_logfile=/var/log/supervisor/php-fpm.log
+# Create database and user
+mysql -e "CREATE DATABASE IF NOT EXISTS panel;"
+mysql -e "CREATE USER IF NOT EXISTS 'pterodactyl'@'localhost' IDENTIFIED BY 'thisisthepasswordforpterodactyl';"
+mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'localhost';"
+mysql -e "FLUSH PRIVILEGES;"
 
-[program:nginx]
-command=/usr/sbin/nginx -g "daemon off;"
-autostart=true
-autorestart=true
-priority=400
-stdout_logfile=/var/log/supervisor/nginx.log
-stderr_logfile=/var/log/supervisor/nginx.log
-
-[program:cron]
-command=/usr/sbin/cron -f
-autostart=true
-autorestart=true
-priority=500
-stdout_logfile=/var/log/supervisor/cron.log
-stderr_logfile=/var/log/supervisor/cron.log
+# Stop background MariaDB
+kill \$MYSQL_PID
+wait \$MYSQL_PID
 EOF
+
+RUN chmod +x /init-db.sh && /init-db.sh
 
 # Create startup script
 COPY <<EOF /start.sh
 #!/bin/bash
 set -e
 
-# Create log directories
-mkdir -p /var/log/supervisor /var/log/redis
-chown redis:redis /var/log/redis
-
 # Start MariaDB
-service mariadb start
+mysqld_safe --user=mysql --datadir=/var/lib/mysql &
 
-# Wait for MariaDB to be ready
-while ! mysqladmin ping --silent; do
-    echo "Waiting for MariaDB..."
-    sleep 2
-done
+# Start Redis
+redis-server /etc/redis/redis.conf &
 
-# Start Redis manually first to ensure it's running
-redis-server /etc/redis/redis.conf --daemonize yes
-sleep 3
+# Wait for services to be ready
+echo "Waiting for MariaDB..."
+while ! mysqladmin ping --silent; do sleep 1; done
 
-# Wait for Redis to be ready
-while ! redis-cli ping > /dev/null 2>&1; do
-    echo "Waiting for Redis..."
-    sleep 2
-done
+echo "Waiting for Redis..."
+while ! redis-cli ping > /dev/null 2>&1; do sleep 1; done
 
-echo "Redis is ready"
-
-# Generate application key if not exists
+# Initialize Laravel
 cd /var/www/html
+
+# Generate app key if needed
 if ! grep -q "APP_KEY=base64:" .env; then
     php artisan key:generate --force
 fi
@@ -239,19 +215,21 @@ fi
 # Run migrations
 php artisan migrate --force
 
-# Seed database (only if tables are empty)
+# Seed database
 php artisan db:seed --force || true
 
 # Fix permissions
 chown -R www-data:www-data /var/www/html
 chmod -R 755 /var/www/html/storage /var/www/html/bootstrap/cache
 
-# Stop the manually started redis since supervisor will manage it
-redis-cli shutdown || true
-sleep 2
+# Start PHP-FPM
+php-fpm8.2 &
 
-# Start all services with supervisor
-exec /usr/bin/supervisord -c /etc/supervisor/conf.d/pterodactyl.conf
+# Start cron
+cron &
+
+# Start Nginx in foreground
+nginx -g "daemon off;"
 EOF
 
 RUN chmod +x /start.sh
