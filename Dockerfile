@@ -143,25 +143,35 @@ RUN chown -R www-data:www-data /var/www/html && \
 RUN echo "* * * * * www-data /usr/bin/php /var/www/html/artisan schedule:run >> /dev/null 2>&1" > /etc/cron.d/pterodactyl && \
     chmod 0644 /etc/cron.d/pterodactyl
 
+# Configure Redis
+RUN mkdir -p /var/log/redis && \
+    chown redis:redis /var/log/redis && \
+    sed -i 's/^bind 127.0.0.1 ::1$/bind 0.0.0.0/' /etc/redis/redis.conf && \
+    sed -i 's/^# supervised no$/supervised systemd/' /etc/redis/redis.conf
+
 # Configure Supervisor
 COPY <<EOF /etc/supervisor/conf.d/pterodactyl.conf
 [supervisord]
 nodaemon=true
 user=root
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
 
 [program:mariadb]
 command=/usr/bin/mysqld_safe
 user=mysql
 autostart=true
 autorestart=true
+priority=100
 stdout_logfile=/var/log/supervisor/mariadb.log
 stderr_logfile=/var/log/supervisor/mariadb.log
 
 [program:redis]
-command=/usr/bin/redis-server
+command=/usr/bin/redis-server /etc/redis/redis.conf --daemonize no
 user=redis
 autostart=true
 autorestart=true
+priority=200
 stdout_logfile=/var/log/supervisor/redis.log
 stderr_logfile=/var/log/supervisor/redis.log
 
@@ -169,6 +179,7 @@ stderr_logfile=/var/log/supervisor/redis.log
 command=/usr/sbin/php-fpm8.2 -F
 autostart=true
 autorestart=true
+priority=300
 stdout_logfile=/var/log/supervisor/php-fpm.log
 stderr_logfile=/var/log/supervisor/php-fpm.log
 
@@ -176,6 +187,7 @@ stderr_logfile=/var/log/supervisor/php-fpm.log
 command=/usr/sbin/nginx -g "daemon off;"
 autostart=true
 autorestart=true
+priority=400
 stdout_logfile=/var/log/supervisor/nginx.log
 stderr_logfile=/var/log/supervisor/nginx.log
 
@@ -183,6 +195,7 @@ stderr_logfile=/var/log/supervisor/nginx.log
 command=/usr/sbin/cron -f
 autostart=true
 autorestart=true
+priority=500
 stdout_logfile=/var/log/supervisor/cron.log
 stderr_logfile=/var/log/supervisor/cron.log
 EOF
@@ -192,6 +205,10 @@ COPY <<EOF /start.sh
 #!/bin/bash
 set -e
 
+# Create log directories
+mkdir -p /var/log/supervisor /var/log/redis
+chown redis:redis /var/log/redis
+
 # Start MariaDB
 service mariadb start
 
@@ -200,6 +217,18 @@ while ! mysqladmin ping --silent; do
     echo "Waiting for MariaDB..."
     sleep 2
 done
+
+# Start Redis manually first to ensure it's running
+redis-server /etc/redis/redis.conf --daemonize yes
+sleep 3
+
+# Wait for Redis to be ready
+while ! redis-cli ping > /dev/null 2>&1; do
+    echo "Waiting for Redis..."
+    sleep 2
+done
+
+echo "Redis is ready"
 
 # Generate application key if not exists
 cd /var/www/html
@@ -216,6 +245,10 @@ php artisan db:seed --force || true
 # Fix permissions
 chown -R www-data:www-data /var/www/html
 chmod -R 755 /var/www/html/storage /var/www/html/bootstrap/cache
+
+# Stop the manually started redis since supervisor will manage it
+redis-cli shutdown || true
+sleep 2
 
 # Start all services with supervisor
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/pterodactyl.conf
