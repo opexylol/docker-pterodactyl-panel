@@ -1,103 +1,61 @@
-# Multi-stage build for Pterodactyl Panel
+# --- Stage 1: Download the Pterodactyl Panel source ---
 FROM alpine AS download
 ARG pterodactyl_panel_version=v1.11.10
-RUN apk add --no-cache \
-        curl \
-        tar
+RUN apk add --no-cache curl tar
 RUN mkdir -p pterodactyl
 RUN curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/download/${pterodactyl_panel_version}/panel.tar.gz
 RUN tar -xzvf panel.tar.gz -C /pterodactyl
 
-# Base PHP setup
+# --- Stage 2: PHP environment for building dependencies ---
 FROM php:8.2-fpm-alpine AS base_php
-RUN apk add --no-cache \
-        freetype-dev \
-        libjpeg-turbo-dev \
-        libpng-dev \
-        unzip \
-        libzip-dev \
-        git \
+RUN apk add --no-cache freetype-dev libjpeg-turbo-dev libpng-dev unzip libzip-dev git \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install -j$(nproc) gd \
-    && docker-php-ext-install -j$(nproc) bcmath \
-    && docker-php-ext-install -j$(nproc) pdo_mysql \
-    && docker-php-ext-install -j$(nproc) zip
+    && docker-php-ext-install -j$(nproc) gd bcmath pdo_mysql zip
 
-# Install PHP dependencies
+# --- Stage 3: Install Composer dependencies ---
 FROM base_php AS install_dependencies
-WORKDIR /var/www/html/
-COPY --from=composer /usr/bin/composer /usr/bin/composer
+WORKDIR /var/www/html
 COPY --from=download /pterodactyl/ .
+COPY --from=composer /usr/bin/composer /usr/bin/composer
 RUN composer install --no-dev --optimize-autoloader
 ADD https://raw.githubusercontent.com/eficode/wait-for/master/wait-for /root/wait-for
 RUN chmod +x /root/wait-for
 
-# Final unified image
+# --- Stage 4: Final runtime image ---
 FROM ubuntu:22.04
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=UTC
+# Environment
+ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 
-# Install all required packages
+# Install required packages
 RUN apt-get update && apt-get install -y \
-    software-properties-common \
-    curl \
-    wget \
-    gnupg \
-    lsb-release \
-    ca-certificates \
-    && add-apt-repository ppa:ondrej/php -y \
-    && apt-get update && apt-get install -y \
-    # MariaDB
-    mariadb-server \
-    mariadb-client \
-    # Redis
-    redis-server \
-    # Nginx
-    nginx \
-    # PHP and extensions
-    php8.2-fpm \
-    php8.2-mysql \
-    php8.2-zip \
-    php8.2-gd \
-    php8.2-mbstring \
-    php8.2-curl \
-    php8.2-xml \
-    php8.2-bcmath \
-    php8.2-cli \
-    php8.2-intl \
-    php8.2-opcache \
-    # Other utilities
-    cron \
-    supervisor \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
+    software-properties-common curl wget gnupg lsb-release ca-certificates \
+    mariadb-server mariadb-client redis-server nginx \
+    php8.2-fpm php8.2-mysql php8.2-zip php8.2-gd php8.2-mbstring \
+    php8.2-curl php8.2-xml php8.2-bcmath php8.2-cli php8.2-intl php8.2-opcache \
+    cron supervisor unzip git && \
+    rm -rf /var/lib/apt/lists/*
 
-# Configure MariaDB
+# MariaDB config
 RUN sed -i 's/^bind-address\s*=.*$/bind-address = 0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf && \
-    mkdir -p /var/run/mysqld && \
-    chown mysql:mysql /var/run/mysqld
+    mkdir -p /var/run/mysqld && chown mysql:mysql /var/run/mysqld
 
-# Configure Redis
-RUN sed -i 's/^bind 127.0.0.1 ::1$/bind 0.0.0.0/' /etc/redis/redis.conf && \
+# Redis config
+RUN sed -i 's/^bind .*/bind 0.0.0.0/' /etc/redis/redis.conf && \
     sed -i 's/^daemonize yes$/daemonize no/' /etc/redis/redis.conf && \
     sed -i 's/^supervised no$/supervised systemd/' /etc/redis/redis.conf && \
-    mkdir -p /var/log/redis && \
-    chown redis:redis /var/log/redis
+    mkdir -p /var/log/redis && chown redis:redis /var/log/redis
 
-# Create PHP configuration files
+# PHP config
 RUN echo "display_errors = On" > /etc/php/8.2/fpm/conf.d/99-extra.ini && \
-    echo "display_errors = On" > /etc/php/8.2/cli/conf.d/99-extra.ini && \
-    echo "upload_max_filesize = 100M" >> /etc/php/8.2/fpm/conf.d/99-extra.ini && \
-    echo "post_max_size = 100M" >> /etc/php/8.2/fpm/conf.d/99-extra.ini
+    echo "upload_max_filesize = 100M\npost_max_size = 100M" >> /etc/php/8.2/fpm/conf.d/99-extra.ini && \
+    echo "display_errors = On" > /etc/php/8.2/cli/conf.d/99-extra.ini
 
-# Configure PHP-FPM
+# PHP-FPM listen config
 RUN sed -i 's/^listen = .*/listen = 127.0.0.1:9000/' /etc/php/8.2/fpm/pool.d/www.conf && \
-    echo "catch_workers_output = yes" >> /etc/php/8.2/fpm/pool.d/www.conf && \
-    echo "chdir = /var/www/html/public/" >> /etc/php/8.2/fpm/pool.d/www.conf
+    echo "catch_workers_output = yes\nchdir = /var/www/html/public/" >> /etc/php/8.2/fpm/pool.d/www.conf
 
-# Configure Nginx
+# Nginx site
 RUN rm -f /etc/nginx/sites-enabled/default
 COPY <<EOF /etc/nginx/sites-available/pterodactyl
 server {
@@ -128,15 +86,15 @@ EOF
 
 RUN ln -s /etc/nginx/sites-available/pterodactyl /etc/nginx/sites-enabled/
 
-# Install Composer
+# Install Composer globally
 RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-# Setup Pterodactyl
+# Pterodactyl files from previous stage
 WORKDIR /var/www/html
 COPY --from=install_dependencies --chown=www-data:www-data /var/www/html/ .
 COPY --from=install_dependencies /var/www/html/.env.example .env
 
-# Configure environment variables for local services
+# Preconfigure .env
 RUN sed -i 's/DB_HOST=.*/DB_HOST=localhost/' .env && \
     sed -i 's/DB_PORT=.*/DB_PORT=3306/' .env && \
     sed -i 's/DB_DATABASE=.*/DB_DATABASE=panel/' .env && \
@@ -146,61 +104,34 @@ RUN sed -i 's/DB_HOST=.*/DB_HOST=localhost/' .env && \
     sed -i 's/REDIS_HOST=.*/REDIS_HOST=localhost/' .env && \
     sed -i 's/REDIS_PORT=.*/REDIS_PORT=6379/' .env
 
-# Set permissions
+# Permissions
 RUN chown -R www-data:www-data /var/www/html && \
     chmod -R 755 /var/www/html/storage /var/www/html/bootstrap/cache
 
-# Setup cron
+# Setup cron job
 RUN echo "* * * * * www-data /usr/bin/php /var/www/html/artisan schedule:run >> /dev/null 2>&1" > /etc/cron.d/pterodactyl && \
     chmod 0644 /etc/cron.d/pterodactyl && \
     crontab /etc/cron.d/pterodactyl
 
-# Create initialization script
-COPY <<EOF /init-db.sh
-#!/bin/bash
-set -e
-
-# Initialize MariaDB
-mysql_install_db --user=mysql --datadir=/var/lib/mysql
-
-# Start MariaDB in background
-mysqld_safe --user=mysql --datadir=/var/lib/mysql &
-MYSQL_PID=\$!
-
-# Wait for MariaDB to be ready
-echo "Waiting for MariaDB to start..."
-while ! mysqladmin ping --silent; do
-    sleep 2
-done
-
-# Create database and user
-mysql -e "CREATE DATABASE IF NOT EXISTS panel;"
-mysql -e "CREATE USER IF NOT EXISTS 'pterodactyl'@'localhost' IDENTIFIED BY 'thisisthepasswordforpterodactyl';"
-mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'localhost';"
-mysql -e "FLUSH PRIVILEGES;"
-
-# Stop background MariaDB
-kill \$MYSQL_PID
-wait \$MYSQL_PID
-EOF
-
-RUN chmod +x /init-db.sh && /init-db.sh
-
-# Create startup script
+# --- Startup Script ---
 COPY <<EOF /start.sh
 #!/bin/bash
 set -e
 
 # Start MariaDB
+echo "Starting MariaDB..."
 mysqld_safe --user=mysql --datadir=/var/lib/mysql &
+MYSQL_PID=\$!
 
 # Wait for MariaDB to be ready
 echo "Waiting for MariaDB..."
-while ! mysqladmin ping --silent; do sleep 1; done
+TIMEOUT=30
+until mysqladmin ping --silent || [ \$TIMEOUT -eq 0 ]; do sleep 1; TIMEOUT=\$((TIMEOUT-1)); done
+if [ \$TIMEOUT -eq 0 ]; then echo "MariaDB failed to start."; exit 1; fi
 
-# Initialize database on first run
+# Setup database if not initialized
 if ! mysql -e "USE panel;" 2>/dev/null; then
-    echo "Setting up database..."
+    echo "Creating panel DB and user..."
     mysql -e "CREATE DATABASE panel;"
     mysql -e "CREATE USER 'pterodactyl'@'localhost' IDENTIFIED BY 'thisisthepasswordforpterodactyl';"
     mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'localhost';"
@@ -208,42 +139,36 @@ if ! mysql -e "USE panel;" 2>/dev/null; then
 fi
 
 # Start Redis
+echo "Starting Redis..."
 redis-server /etc/redis/redis.conf &
 
 # Wait for Redis
 echo "Waiting for Redis..."
-while ! redis-cli ping > /dev/null 2>&1; do sleep 1; done
+until redis-cli ping | grep -q PONG; do sleep 1; done
 
-# Initialize Laravel
+# Laravel setup
 cd /var/www/html
 
-# Generate app key if needed
 if ! grep -q "APP_KEY=base64:" .env; then
+    echo "Generating Laravel key..."
     php artisan key:generate --force
 fi
 
-# Run migrations
+echo "Running migrations and seeders..."
 php artisan migrate --force
-
-# Seed database
 php artisan db:seed --force || true
 
-# Fix permissions
+# Permissions
 chown -R www-data:www-data /var/www/html
 chmod -R 755 /var/www/html/storage /var/www/html/bootstrap/cache
 
-# Start PHP-FPM
+# Start PHP-FPM, cron, Nginx
 php-fpm8.2 &
-
-# Start cron
 cron &
-
-# Start Nginx in foreground
 nginx -g "daemon off;"
 EOF
 
 RUN chmod +x /start.sh
 
 EXPOSE 80
-
 CMD ["/start.sh"]
